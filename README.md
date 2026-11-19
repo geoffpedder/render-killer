@@ -15,3 +15,7 @@ To rebuild the exe after changing the source, run `build.bat`. The first run cre
 - Double-click a row, or use **Open job folder**, to open the dispatcher job directory. **Copy command** copies the `gaffer execute` command line, so you can rerun a single task by hand.
 
 Interactive renders run inside the Gaffer GUI process, so they don't appear in the list.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
