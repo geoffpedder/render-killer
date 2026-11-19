@@ -2,6 +2,8 @@
 
 A small Windows app that lists Gaffer background renders and standalone `kick` and `prman` renders, and kills them.
 
+![Render Killer listing a Gaffer dispatcher task, a scripted Gaffer RenderMan render, kick and prman](docs/screenshot.png)
+
 It picks up Gaffer dispatcher tasks (`gaffer execute`), scripted Gaffer renders (`gaffer python` and `gaffer dispatch`), and command-line or LocalQueue `prman` and `kick` runs. Gaffer renders Arnold and RenderMan inside its own process, so each Gaffer row is labelled with the renderer it has loaded, for example "Gaffer python (RenderMan)".
 
 Run `dist\RenderKiller.exe` (or `Render Killer.lnk`). The exe is self-contained, so you can copy it anywhere. To run from source, use `pyw -3.14 render_killer.pyw`. The source uses only the Python standard library.

@@ -295,7 +295,7 @@ def formatMem( b ) :
 class App( tk.Tk ) :
 
 	COLUMNS = (
-		( "kind", "Type", 100 ),
+		( "kind", "Type", 175 ),
 		( "job", "Job", 170 ),
 		( "node", "Node", 110 ),
 		( "frames", "Frames", 70 ),
@@ -310,7 +310,7 @@ class App( tk.Tk ) :
 
 		tk.Tk.__init__( self )
 		self.title( "Render Killer" )
-		self.geometry( "1100x360" )
+		self.geometry( "1180x360" )
 		self.minsize( 700, 220 )
 		self.configure( bg = BG )
 		# PyInstaller unpacks bundled files to sys._MEIPASS.
