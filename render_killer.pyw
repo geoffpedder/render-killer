@@ -1,13 +1,17 @@
-"""Render Killer: lists Gaffer background renders and kick renders, and kills them.
+"""Render Killer: lists Gaffer background renders and kick and prman renders, and kills them.
 
 Gaffer's LocalDispatcher runs each background task as its own
 `gaffer execute` process tree. Killing that tree fails the task, and the
 dispatcher then stops the rest of the job, the same as cancelling it in
 Gaffer's Local Jobs panel.
 
+Gaffer renders Arnold and RenderMan inside its own process, so the renderer
+is identified from the DLL it has loaded (`ai.dll` or `libprman.dll`).
+
 Standard library only. Process info comes from PowerShell's CIM query.
 """
 
+import base64
 import datetime
 import json
 import os
@@ -24,11 +28,24 @@ REFRESH_SECONDS = 2.0
 CPU_COUNT = os.cpu_count() or 1
 NO_WINDOW = 0x08000000  # CREATE_NO_WINDOW
 
-PS_QUERY = (
-	"Get-CimInstance Win32_Process | "
-	"Select-Object ProcessId,ParentProcessId,Name,CommandLine,CreationDate,"
-	"KernelModeTime,UserModeTime,WorkingSetSize | ConvertTo-Json -Compress"
-)
+RENDERER_DLLS = { "ai.dll" : "Arnold", "libprman.dll" : "RenderMan" }
+
+# Module lists are only read for Gaffer render processes, because reading
+# them for every process would make each scan slow.
+PS_QUERY = r"""
+$procs = Get-CimInstance Win32_Process
+$modules = @{}
+foreach ( $p in $procs | Where-Object { $_.Name -eq 'gaffer.exe' -and $_.CommandLine -match '\s(execute|python|dispatch)\s' } ) {
+	try {
+		$modules["$($p.ProcessId)"] = @( ( Get-Process -Id $p.ProcessId -ErrorAction Stop ).Modules |
+			Where-Object { $_.ModuleName -match '^(ai|libprman)\.dll$' } | ForEach-Object { $_.ModuleName.ToLower() } )
+	} catch {}
+}
+@{
+	procs = @( $procs | Select-Object ProcessId,ParentProcessId,Name,CommandLine,CreationDate,KernelModeTime,UserModeTime,WorkingSetSize )
+	modules = $modules
+} | ConvertTo-Json -Compress -Depth 3
+"""
 
 BG = "#2b2b2b"
 PANEL = "#373737"
@@ -45,11 +62,14 @@ DANGER = "#c4554d"
 def queryProcesses() :
 
 	out = subprocess.run(
-		[ "powershell", "-NoProfile", "-NonInteractive", "-Command", PS_QUERY ],
+		# -EncodedCommand avoids command-line quoting problems with the multi-line script.
+		[ "powershell", "-NoProfile", "-NonInteractive", "-EncodedCommand", base64.b64encode( PS_QUERY.encode( "utf-16-le" ) ).decode() ],
 		capture_output = True, text = True, creationflags = NO_WINDOW,
 	).stdout
+	data = json.loads( out or "{}" )
+	modules = data.get( "modules" ) or {}
 	procs = {}
-	for p in json.loads( out or "[]" ) :
+	for p in data.get( "procs" ) or [] :
 		created = p.get( "CreationDate" )
 		if isinstance( created, str ) :
 			m = re.search( r"\d+", created )
@@ -65,6 +85,7 @@ def queryProcesses() :
 			# CIM times are in 100ns units.
 			"cpu" : ( ( p.get( "KernelModeTime" ) or 0 ) + ( p.get( "UserModeTime" ) or 0 ) ) / 1e7,
 			"mem" : p.get( "WorkingSetSize" ) or 0,
+			"modules" : modules.get( str( p["ProcessId"] ) ) or [],
 		}
 	return procs
 
@@ -76,22 +97,35 @@ def gafferApp( p ) :
 	tasks, `python` or `dispatch` for scripted renders), or None. The GUI has
 	no app argument, so it never matches."""
 
-	if p["name"] not in ( "cmd.exe", "python.exe", "gaffer.exe" ) or "gaffer" not in p["cmd"].lower() :
+	# Each launcher stage must be running Gaffer itself, not just mention it in
+	# its arguments: `cmd /c gaffer.cmd`, `python _gaffer.py`, or `gaffer.exe`.
+	launcher = {
+		"cmd.exe" : r"^\S*cmd(?:\.exe)?\"?\s+/[cC]\s+\"?[^\"\s]*gaffer\.cmd",
+		"python.exe" : r"^\"?[^\"]*\"?[^\"\s]*python\.exe\"?\s+\"?[^\"]*\"?[^\"\s]*_gaffer\.py",
+		"gaffer.exe" : r"^\"?[^\"\s]*gaffer\.exe",
+	}.get( p["name"] )
+	if launcher is None :
 		return None
-	m = re.search( r"gaffer(?:\.cmd|\.exe|\.py)?\"?\s+(" + "|".join( GAFFER_APPS ) + r")\s", p["cmd"], re.IGNORECASE )
+	m = re.match( launcher + r"\"?\s+(" + "|".join( GAFFER_APPS ) + r")\s", p["cmd"], re.IGNORECASE )
 	return m.group( 1 ).lower() if m else None
 
 def isGafferExecute( p ) :
 
 	return gafferApp( p ) is not None
 
-def isKick( p ) :
+# Standalone renderers, with the scene file extensions they take.
+STANDALONE = {
+	"kick.exe" : ( "kick", ( ".ass", ".ass.gz", ".usd", ".usda", ".usdc" ) ),
+	"prman.exe" : ( "prman", ( ".rib", ".rib.gz", ".usd", ".usda", ".usdc" ) ),
+}
 
-	return p["name"] == "kick.exe"
+def isStandalone( p ) :
+
+	return p["name"] in STANDALONE
 
 def isRender( p ) :
 
-	return isGafferExecute( p ) or isKick( p )
+	return isGafferExecute( p ) or isStandalone( p )
 
 def descendants( procs, pid ) :
 
@@ -109,10 +143,12 @@ def descendants( procs, pid ) :
 
 def splitArgs( cmd ) :
 
+	# Non-POSIX mode keeps Windows backslashes; it leaves quotes on, so strip them.
 	try :
-		return shlex.split( cmd, posix = True )
+		args = shlex.split( cmd, posix = False )
 	except ValueError :
-		return cmd.split()
+		args = cmd.split()
+	return [ a[1:-1] if len( a ) > 1 and a[0] == a[-1] and a[0] in "'\"" else a for a in args ]
 
 def describeGaffer( cmd ) :
 
@@ -162,10 +198,10 @@ def describeGafferScript( cmd, app ) :
 		"context" : others, "jobDir" : os.path.dirname( scene or script ),
 	}
 
-def describeKick( cmd ) :
+def describeStandalone( cmd, extensions ) :
 
 	args = splitArgs( cmd )
-	scene = next( ( a for a in args[1:] if a.lower().endswith( ( ".ass", ".ass.gz", ".usd", ".usda", ".usdc" ) ) ), "" )
+	scene = next( ( a for a in args[1:] if a.lower().endswith( extensions ) ), "" )
 	return {
 		"script" : scene, "node" : "", "frames" : "", "context" : [],
 		"jobDir" : os.path.dirname( scene ) if scene else "",
@@ -200,12 +236,16 @@ def findRenders( procs ) :
 				info = describeGafferScript( gafferCmds[-1], app )
 				kind = "Gaffer " + app
 				job = info["job"]
-			if any( isKick( m ) for m in members ) :
-				kind += " + kick"
+			renderers = sorted( { RENDERER_DLLS[d] for m in gafferProcs for d in m["modules"] if d in RENDERER_DLLS } )
+			if renderers :
+				kind += " ({})".format( ", ".join( renderers ) )
+			for name in sorted( { m["name"] for m in members if isStandalone( m ) } ) :
+				kind += " + " + STANDALONE[name][0]
 		else :
-			info = describeKick( p["cmd"] )
-			kind = "kick"
-			job = os.path.basename( info["script"] ) or "kick"
+			label, extensions = STANDALONE[p["name"]]
+			info = describeStandalone( p["cmd"], extensions )
+			kind = label
+			job = os.path.basename( info["script"] ) or label
 
 		renders.append( {
 			"pid" : p["pid"],
